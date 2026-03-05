@@ -3,11 +3,12 @@ import pandas as pd
 import json
 import os
 import base64
+from streamlit_gsheets import GSheetsConnection
 
 # 1. KONFIGURASI HALAMAN
 st.set_page_config(page_title="Develop Arif - Calibration", layout="wide")
 
-# 2. WATERMARK (Diletakkan di sini agar selalu muncul di semua halaman)
+# 2. WATERMARK
 st.markdown(
     """
     <style>
@@ -28,33 +29,53 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# --- FUNGSI DATABASE ---
-DB_FILE = "database_kalibrasi.json"
+# --- 3. FUNGSI DATABASE (GOOGLE SHEETS VERSION) ---
+# Menghubungkan ke Google Sheets
+conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_data():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            data = json.load(f)
-            for sn in data:
-                data[sn]['data'] = pd.DataFrame(data[sn]['data'])
-            return data
-    return {}
+    try:
+        # Membaca data dari Google Sheets (ttl=0 agar data selalu paling baru)
+        df = conn.read(ttl="0s")
+        if df.empty:
+            return {}
+        
+        # Mengubah data dari tabel Google Sheets kembali ke format Dictionary (Session State)
+        data_dict = {}
+        for _, row in df.iterrows():
+            data_dict[str(row['no_seri'])] = {
+                "nama": row['nama'],
+                "satuan": row['satuan'],
+                "info_toleransi": row['info_toleransi'],
+                "final_status": row['final_status'],
+                "data": pd.DataFrame(json.loads(row['data_json'])) # Tabel CSV disimpan sebagai JSON
+            }
+        return data_dict
+    except:
+        return {}
 
-def save_data(data):
-    data_to_save = {}
-    for sn, info in data.items():
-        data_to_save[sn] = {
+def save_to_sheets(all_data):
+    # Mengubah format Dictionary ke Tabel (DataFrame) untuk diupload ke Google Sheets
+    rows = []
+    for sn, info in all_data.items():
+        rows.append({
+            "no_seri": sn,
             "nama": info['nama'],
+            "satuan": info['satuan'],
+            "info_toleransi": info['info_toleransi'],
             "final_status": info['final_status'],
-            "data": info['data'].to_dict(orient='records')
-        }
-    with open(DB_FILE, "w") as f:
-        json.dump(data_to_save, f)
+            "data_json": json.dumps(info['data'].to_dict(orient='records'))
+        })
+    
+    if rows:
+        updated_df = pd.DataFrame(rows)
+        conn.update(data=updated_df)
 
+# Inisialisasi Database
 if 'database_alat' not in st.session_state:
     st.session_state.database_alat = load_data()
 
-# --- 3. SISTEM LOGIN ---
+# --- 4. SISTEM LOGIN ---
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 
@@ -85,7 +106,7 @@ def login():
 if not st.session_state.authenticated:
     login()
 
-# --- 4. DASHBOARD UTAMA ---
+# --- 5. DASHBOARD UTAMA ---
 st.title("🛡️ Hasil Evaluasi Kalibrasi")
 st.markdown("---")
 
@@ -118,12 +139,16 @@ with st.sidebar:
                 df_temp['Status'] = df_temp['Koreksi'].apply(lambda x: "OK ✅" if abs(x) <= toleransi else "NG ❌")
                 info_tol = f"{toleransi} {satuan}"
             
+            # Simpan ke Session State
             st.session_state.database_alat[no_seri] = {
                 "nama": nama_alat, "data": df_temp, "satuan": satuan, "info_toleransi": info_tol,
                 "final_status": "NG ❌" if any(df_temp['Status'] == "NG ❌") else "OK ✅"
             }
-            save_data(st.session_state.database_alat)
-            st.success(f"Data {nama_alat} Tersimpan!")
+            
+            # SIMPAN PERMANEN KE GOOGLE SHEETS
+            save_to_sheets(st.session_state.database_alat)
+            
+            st.success(f"Data {nama_alat} Berhasil Tersimpan di Cloud!")
             st.rerun()
 
     if st.session_state.database_alat:
@@ -134,21 +159,27 @@ with st.sidebar:
         if st.button("Konfirmasi Hapus"):
             sn_target = list_hapus_label[alat_mau_dihapus_label]
             del st.session_state.database_alat[sn_target]
-            save_data(st.session_state.database_alat)
+            # Update perubahan hapus ke Cloud
+            save_to_sheets(st.session_state.database_alat)
             st.rerun()
 
+# Menampilkan Ringkasan
 if st.session_state.database_alat:
     st.write("### 📊 Status Alat Saat Ini")
     jml_alat = len(st.session_state.database_alat)
-    cols = st.columns(max(jml_alat, 1))
+    # Membuat kolom maksimal 4 agar tidak terlalu rapat
+    n_cols = min(jml_alat, 4)
+    cols = st.columns(n_cols)
+    
     for i, (sn, info) in enumerate(st.session_state.database_alat.items()):
-        with cols[i]:
+        with cols[i % 4]:
             st.metric(label=f"{info['nama']} ({sn})", value=info['final_status'])
 
     st.markdown("---")
     pilihan_label = {f"{info['nama']} - {sn}": sn for sn, info in st.session_state.database_alat.items()}
     selected_label = st.selectbox("Pilih Alat untuk Lihat Detail:", list(pilihan_label.keys()))
     pilihan_sn = pilihan_label[selected_label]
+    
     if pilihan_sn:
         res = st.session_state.database_alat[pilihan_sn]
         st.write(f"#### Detail Sertifikat: {res['nama']} - {pilihan_sn}")
